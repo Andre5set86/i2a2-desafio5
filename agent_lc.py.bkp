@@ -1,0 +1,178 @@
+from __future__ import annotations
+from typing import Any, Dict, List, Optional, Type
+
+from pydantic import BaseModel, ValidationError, Field
+from langchain_openai import ChatOpenAI
+from langchain.agents import initialize_agent, AgentType
+from langchain.tools import StructuredTool
+
+# Imports compatíveis com seu layout (pacote ou arquivos soltos)
+try:
+    from tools import (
+        TOOLS,
+        HistInput, SummaryInput, MinMaxInput, FraudRatioInput, TimePatternInput,
+        TopNInput, ModeInput, ClusterInput, OutliersInput, ScatterInput,
+        CorrelationInput, FeatureImportanceInput,
+    )
+    from data_repo import DataRepo
+except Exception:
+    from tools import (
+        TOOLS,
+        HistInput, SummaryInput, MinMaxInput, FraudRatioInput, TimePatternInput,
+        TopNInput, ModeInput, ClusterInput, OutliersInput, ScatterInput,
+        CorrelationInput, FeatureImportanceInput,
+    )
+    from data_repo import DataRepo
+
+
+# ---- Schema vazio p/ tools sem parâmetros ----
+class _Empty(BaseModel):
+    pass
+
+
+# ---- Mapeia cada tool ao seu schema p/ JSON Schema correto (crítico no LangChain) ----
+SCHEMAS: Dict[str, Optional[Type[BaseModel]]] = {
+    "list_columns": _Empty,
+    "histogram": HistInput,
+    "summary": SummaryInput,
+    "minmax": MinMaxInput,
+    "fraud_ratio": FraudRatioInput,
+    "time_patterns": TimePatternInput,
+    "topn": TopNInput,
+    "mode": ModeInput,
+    "cluster": ClusterInput,
+    "outliers": OutliersInput,
+    "scatterplot": ScatterInput,
+    "correlation": CorrelationInput,
+    "feature_importance": FeatureImportanceInput,
+}
+
+DESCRIPTIONS: Dict[str, str] = {
+    "list_columns": "Lista colunas e tipos do CSV.",
+    "histogram": "Gera histograma de uma coluna numérica. Requer 'column'; opcional 'bins'.",
+    "summary": "Estatísticas: count, mean, std, var, min, median, max. Pode filtrar por 'columns' e 'by_class'.",
+    "minmax": "Mínimo e máximo por coluna. 'columns' opcional; se vazio, todas.",
+    "fraud_ratio": "Totais e proporção de fraudes com base na coluna 'Class' (0/1).",
+    "time_patterns": "Série temporal agregada por frequência ('H','D',...). Requer coluna 'Time' no dataset.",
+    "topn": "Top N linhas por coluna (ex.: 'Amount'). Campos: column, n, desc.",
+    "mode": "Valores mais frequentes de uma coluna (top N).",
+    "cluster": "KMeans em colunas numéricas (opcional 'columns'); parâmetros: k, sample.",
+    "outliers": "Detecta outliers por 'iqr' ou 'zscore' em uma coluna numérica.",
+    "scatterplot": "Gera gráfico de dispersão entre duas colunas numéricas (x,y).",
+    "correlation": "Matriz de correlação (pearson/spearman) + top pares.",
+    "feature_importance": "Importância de variáveis (árvore) para prever 'target' (padrão 'Class').",
+}
+
+
+def _wrap_tool(repo: DataRepo, name: str, fn, schema: Optional[Type[BaseModel]]):
+    """
+    Cria um StructuredTool com JSON Schema específico por ferramenta.
+    Usa **kwargs para aceitar campos diretamente do args_schema do LangChain.
+    Faz validação Pydantic e retorna erro amigável em vez de levantar exceção.
+    """
+
+    # Função que o LangChain efetivamente chama (os campos vêm como kwargs)
+    def _runner(**kwargs):
+        # Normaliza args e valida (se houver schema)
+        try:
+            if schema is None:
+                args = {}
+            else:
+                model = schema(**(kwargs or {}))
+                # Pydantic v2: usar model.model_dump() (ou .dict() em v1)
+                args = getattr(model, "model_dump", getattr(model, "dict"))()
+        except ValidationError as ve:
+            # Retorna orientação para o LLM (e para o usuário)
+            required = list(getattr(schema, "model_fields", {}).keys()) if schema else []
+            return {
+                "error": f"Parâmetros inválidos para '{name}': {str(ve)}",
+                "required": required,
+                "given": kwargs or {},
+            }
+        except Exception as e:
+            return {"error": f"Falha ao validar parâmetros de '{name}': {str(e)}", "given": kwargs or {}}
+
+        # Executa a tool real (repo, args)
+        try:
+            return fn(repo, args)
+        except Exception as e:
+            return {"error": f"Erro na ferramenta '{name}': {str(e)}", "args": args}
+
+    # Monta o StructuredTool com schema e descrição
+    args_schema = schema or _Empty
+    description = DESCRIPTIONS.get(name, f"Ferramenta '{name}'.")
+    return StructuredTool.from_function(
+        func=_runner,
+        name=name,
+        description=description,
+        args_schema=args_schema,
+        return_direct=False,
+    )
+
+
+def build_lc_agent(api_key: str, repo: DataRepo, model: str = "gpt-4o-mini", temperature: float = 0.4):
+    llm = ChatOpenAI(model=model, temperature=temperature, api_key=api_key)
+    tools = []
+    for name, fn in TOOLS.items():
+        schema = SCHEMAS.get(name, _Empty)
+        tools.append(_wrap_tool(repo, name, fn, schema))
+
+    agent = initialize_agent(
+        tools=tools,
+        llm=llm,
+        agent=AgentType.OPENAI_FUNCTIONS,  # usa JSON Schema das tools
+        max_iterations=8,
+        early_stopping_method="generate",
+        verbose=False,
+        handle_parsing_errors=True,        # evita estouro por parsing
+    )
+    return agent
+
+
+def _collect_image_urls_from_obs(observation: Any) -> List[str]:
+    """Extrai /images/... de dicts/listas arbitrárias (resultados das tools)."""
+    urls: List[str] = []
+
+    def _walk(obj: Any):
+        if isinstance(obj, dict):
+            if "image_url" in obj and isinstance(obj["image_url"], str):
+                urls.append(obj["image_url"])
+            if "image_path" in obj and isinstance(obj["image_path"], str):
+                import os
+                urls.append(f"/images/{os.path.basename(obj['image_path'])}")
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                _walk(v)
+
+    _walk(observation)
+    # dedup
+    seen = set(); out = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u); out.append(u)
+    return out
+
+
+def run_lc_agent(api_key: str, repo: DataRepo, question: str) -> Dict[str, Any]:
+    agent = build_lc_agent(api_key=api_key, repo=repo)
+    res = agent.invoke({"input": question})
+    output = res.get("output") or res
+    print(output)
+    # intermediate_steps pode variar entre versões; tente ambos formatos
+    inter = res.get("intermediate_steps", []) or res.get("INTERMEDIATE_STEPS", []) or []
+    print(inter)
+    # Cada item pode ser (AgentAction, Observation). Coletar imagens dos observations:
+    images: List[str] = []
+    for item in inter:
+        print(item)
+        if isinstance(item, tuple) and len(item) == 2:
+            obs = item[1]
+            images.extend(_collect_image_urls_from_obs(obs))
+        else:
+            images.extend(_collect_image_urls_from_obs(item))
+
+    # dedup final
+    seen = set(); images = [u for u in images if not (u in seen or seen.add(u))]
+    return {"answer": output, "images": images}
