@@ -99,6 +99,9 @@ def memory_debug(session_id: Optional[str] = "default"):
     msgs = mem.chat_memory.messages if hasattr(mem, "chat_memory") else []
     return {"session_id": session_id or "default", "messages": len(msgs)}
 
+@app.get("/kaithhealth")
+def get_health():
+    return "OK"
 
 @app.post("/set_key")
 def set_key(api_key: str = Form(...)):
